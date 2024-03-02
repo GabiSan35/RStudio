@@ -1,0 +1,215 @@
+# 01 LIBRARIES 
+
+libs<- c(
+  "terra",
+  "giscoR",
+  "sf",
+  "tidyverse",
+  "ggtern",
+  "elevatr",
+  "png",
+  "rayshader",
+  "magick"
+)
+
+installed_libraries <- libs %in% rownames(
+  installed.packages()
+)
+
+if(any(installed_libraries == F)){
+  install.packages(
+    libs[!installed_libraries]
+  )
+}
+
+invisible(
+  lapply(
+    libs, library, character.only = T
+  )
+)
+install.packages("terra")
+library("terra")
+install.packages("giscoR")
+install.packages("ggtern")
+
+# 02 COUNTRY BOUNDARIES
+
+country_sf<- giscoR::gisco_get_countries(
+  country = "BA",
+  resolution ="1"
+)
+
+urls<-c(
+  "https://lulctimeseries.blob.core.windows.net/lulctimeseriesv003/lc2022/33T_20220101-20230101.tif",
+  "https://lulctimeseries.blob.core.windows.net/lulctimeseriesv003/lc2022/34T_20220101-20230101.tif"
+)
+getwd()
+setwd("/Users/gabrielsanchezsoler/Desktop/DOCS/Programas/RStudio/Proyectos")
+for(url in urls){
+  download.file(
+    url = url, 
+    destfile = basename(url),
+    mode = "wb"
+  )
+}
+
+# 03 LOAD FILES | ENLIST RASTER FILES 
+raster_files<-list.files(
+  path = setwd(dir = "/Users/gabrielsanchezsoler/Desktop/DOCS/Programas/RStudio/Proyectos"),
+  pattern = "tif",
+  full.names = T
+) 
+getwd()
+crs<-"EPSG:4326"
+for(raster in raster_files){
+  rasters<-terra::rast(raster)
+  
+  country<- country_sf |>
+    sf::st_transform(
+      crs = terra::crs(
+        rasters
+        )
+    )
+  
+  land_cover<- terra::crop(
+    rasters,
+    terra::vect(country),
+    snap = "in",
+    mask = T
+  )|>
+  terra::aggregate(
+    fact = 5,
+    fun ="modal"
+  )|>
+  terra::project(crs)
+  
+  terra::writeRaster(
+    land_cover,
+    paste0(
+      raster,
+      "_bosnia",
+      ".tif"
+    )
+  )
+}
+
+# 04 LOAD VIRTUAL LAYER
+
+r_list<- list.files(
+  path = getwd(),
+  pattern = "_bosnia",
+  full.names = T
+)
+
+land_cover_vrt<-terra::vrt(
+  r_list,
+  "bosnia_land_cover_vrt.vrt",
+  overwrite = T
+)
+
+# 05 FETCH ORIGINAL COLORS
+
+ras<-terra::rast(
+  raster_files[[1]]
+)
+raster_color_table<-do.call(
+  data.frame,
+  terra::coltab(ras)
+)
+
+head(raster_color_table)
+#* Aquí podemos ver que los valores son de RGB. Ésto no es muy útil en R porque R utiliza 
+#* valores de 6 dígitos, entoces tenemos que transformalos:
+
+hex_code<-ggtern::rgb2hex(
+  r= raster_color_table[,2],
+  g= raster_color_table[,3],
+  b= raster_color_table[,4]
+) 
+#* Asignamos cada color (r,g ó b) a la columna de la tabla de colores que habíamos creado
+
+# 06 ASSIGN COLORS TO RASTER
+
+#* Estos son los colores que aparecen al abrir la tabla "hex_code" y vemos que aparecen 
+#* colores negros que no necesitamos #000000
+
+c("#000000","#419bdf","#397d49","#000000", "#7a87c6", "#e49635" ,"#000000", "#c4281b" ,"#a59b8f" ,"#a8ebff", "#616161", "#e3e2c3")
+
+cols<- hex_code[c(2:3,5:6,8:12)] #* aquí definimos cuáles son los que queremos
+
+#* Para hacer el mapa tenemos que saber qué colores queremos (paso anterior) y por cuáles substituirlos
+#* en la escala RGB de nuevo
+#* 
+from<- c(1:2,4:5,7:11) #* Como ya sabemos que el primer argumento no lo queremos (#000000) restamos 1 a cada valor del vector
+to<-(col2rgb(cols)) #* Aplicamos la función que los transforma en la escala RGB
+
+land_cover_vrt<-na.omit(land_cover_vrt) #* Omitimos los valores perdidos o nulos
+
+#* Finalmente substituimos los valores con la función subst() del paquete "terra"
+land_cover_bosnia<- terra::subst(
+  land_cover_vrt,
+  from =from,
+  to =to,
+  names = cols
+)
+
+#* Ahora ya creamos el mapa 2D (sin ningún modelo de elevación)
+terra::plotRGB(
+  land_cover_bosnia
+)
+
+# 07 DIGITAL ELEVATION MODEL
+
+#* Creamos el modelo de elevación
+  #* country_sf delimita las fronteras de Bosnia que es lo que queremos (lo hemos definido arriba)
+  #* z = nivel de zoom, a mayor tamaño del país menor número
+elev<-elevatr::get_elev_raster(
+  locations = country_sf,
+  z = 9,
+  clip = "location"
+)
+
+#* Con el modelo de elevación creaado, tenemos que ajustar su resolución y la resolución de la capa de cobertura
+
+#* Primero hay que definir la proyección de la capa de Bosnia
+
+crs_lambert<-
+  "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +datum=WGS84"
+
+#* Ahora definimo qué resolución y cómo vamos a ajustarla
+  #* x = la capa que queremos reajustar
+  #* y = qué vamos a utilizar para reajustar
+  #* methods = método que vamos a utilizar para reajustar. 
+    #* Importante porque vamos a lidiar con datos discretos, entonces usaremos "near"
+  #* 
+land_cover_bosnia_resampled<- terra::resample(
+  x = land_cover_bosnia,
+  y = terra::rast(elev),
+  method = "near"
+)|>
+terra::project(crs_lambert)
+
+#* Ahora podemos volver a hacer el mapa con el modelo de elevación
+terra::plotRGB(
+  land_cover_bosnia_resampled
+)
+
+# 08 EXPORTAR EL RÁSTER COMO IMAGEN
+
+#* Nombre del archivo
+img_file<-"land_cover_bosnia.tif"
+
+#* Para guardarlo usamos:
+  #* objeto que vamos a guardar,
+  #* nombre que vamos a usar,
+  #* si queremos sobreescribir lo que ya tenemos guardado (opcional)
+  #* Declarar que los na values en nuestro caso serán los que tengan el valor RGB 255
+terra::writeRaster(
+  land_cover_bosnia_resampled,
+  img_file,
+  overwrite = T,
+  NAflag = 255
+)
+
+img<- png::readPNG(img_file)
+
